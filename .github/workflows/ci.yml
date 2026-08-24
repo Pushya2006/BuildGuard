@@ -27,6 +27,9 @@ jobs:
       - name: Build artifact and collect build evidence
         run: python scripts/build.py
 
+      - name: Generate SLSA provenance
+        run: python scripts/generate_provenance.py
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -38,3 +41,9 @@ jobs:
         with:
           name: buildguard-evidence
           path: dist/build-evidence.json
+
+      - name: Upload SLSA provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildguard-provenance
+          path: dist/provenance.json
