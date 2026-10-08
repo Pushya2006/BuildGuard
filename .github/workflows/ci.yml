@@ -30,20 +30,43 @@ jobs:
       - name: Generate SLSA provenance
         run: python scripts/generate_provenance.py
 
+      - name: Verify build evidence and provenance
+        run: python scripts/verify_evidence.py
+
+      - name: Evaluate assurance
+        run: python scripts/evaluate_assurance.py
+
       - name: Upload build artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: buildguard-artifact
           path: dist/buildguard-artifact.zip
 
       - name: Upload build evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: buildguard-evidence
           path: dist/build-evidence.json
 
       - name: Upload SLSA provenance
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: buildguard-provenance
           path: dist/provenance.json
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildguard-verification
+          path: dist/verification-report.json
+
+      - name: Upload assurance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildguard-assurance
+          path: dist/assurance-report.json
