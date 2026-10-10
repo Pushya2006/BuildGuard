@@ -215,9 +215,14 @@ def test_missing_artifact_fails_safely(tmp_path):
     assert report["checks"]["artifact_exists"] == "FAIL"
 
 
-def test_source_commit_check_skipped_when_no_source_info(tmp_path):
+def test_source_commit_check_skipped_when_no_source_info(tmp_path, monkeypatch):
     """A local build with no repository/commit_sha should SKIP, not FAIL,
     the source_commit_match check (nothing to verify it against)."""
+
+    # Remove GitHub variables to simulate a local build.
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+
     repo_root = build.get_repository_root()
     artifact_path = build.create_build_artifact(repo_root, tmp_path)
     artifact_digest = build.calculate_sha256(artifact_path)
@@ -232,7 +237,6 @@ def test_source_commit_check_skipped_when_no_source_info(tmp_path):
     assert report["checks"]["source_commit_match"] == "SKIP"
     # A skipped check should not, by itself, fail overall verification.
     assert report["verification_status"] == "PASS"
-
 
 def test_report_written_to_disk_is_valid_json(valid_dist):
     report = verify_evidence.verify(valid_dist)
