@@ -33,6 +33,9 @@ jobs:
       - name: Verify build evidence and provenance
         run: python scripts/verify_evidence.py
 
+      - name: Run automated tamper detection test
+        run: python scripts/test_tamper_detection.py
+
       - name: Evaluate assurance
         run: python scripts/evaluate_assurance.py
 
@@ -70,3 +73,10 @@ jobs:
         with:
           name: buildguard-assurance
           path: dist/assurance-report.json
+
+      - name: Upload tamper-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildguard-tamper-test
+          path: dist/tamper-test-report.json
