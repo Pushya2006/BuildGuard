@@ -12,6 +12,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 DIST_DIR_NAME = "dist"
 ARTIFACT_FILENAME = "buildguard-artifact.zip"
@@ -61,6 +62,69 @@ def load_json_file(path: Path):
         return None, f"File is not valid JSON ({path}): {exc}"
     except (OSError, UnicodeError) as exc:
         return None, f"Could not read file ({path}): {exc}"
+
+
+def normalize_repository_identity(repository: str):
+    """Normalize a repository URL or owner/repository identifier.
+
+    Returns a canonical owner/repository string, or None if the
+    input cannot be interpreted as a supported repository identity.
+    """
+    if not isinstance(repository, str):
+        return None
+
+    value = repository.strip()
+    if not value:
+        return None
+
+    # Accept HTTPS, SSH-style Git URLs, and owner/repository identifiers.
+    if "://" in value:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+
+        if not host:
+            return None
+
+        path = parsed.path.strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+
+        parts = [part for part in path.split("/") if part]
+
+        if host not in {"github.com", "www.github.com"}:
+            return None
+
+        if len(parts) != 2:
+            return None
+
+        owner, repo = parts
+
+    elif value.startswith("git@github.com:"):
+        path = value.split(":", 1)[1].strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 2:
+            return None
+
+        owner, repo = parts
+
+    else:
+        path = value.strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 2:
+            return None
+
+        owner, repo = parts
+
+    if not owner or not repo:
+        return None
+
+    return f"{owner.lower()}/{repo.lower()}"
 
 
 class VerificationResult:
@@ -266,7 +330,6 @@ def verify(dist_dir: Path) -> dict:
         )
         return result.to_report()
 
-    # FIX: JSON can be valid but have the wrong top-level type.
     if not isinstance(provenance, dict):
         reason = (
             "provenance.json must contain a JSON object; "
@@ -415,7 +478,21 @@ def verify(dist_dir: Path) -> dict:
             "(expected for local, non-GitHub-Actions builds)",
         )
 
+    elif (
+        not isinstance(evidence_repository, str)
+        or not isinstance(evidence_commit_sha, str)
+    ):
+        result.record(
+            "source_commit_match",
+            False,
+            "Repository and commit_sha must both be strings",
+        )
+
     else:
+        expected_repository = normalize_repository_identity(
+            evidence_repository
+        )
+
         predicate = provenance.get("predicate")
         if not isinstance(predicate, dict):
             predicate = {}
@@ -434,22 +511,26 @@ def verify(dist_dir: Path) -> dict:
             if not isinstance(dependency, dict):
                 continue
 
-            dependency_uri = dependency.get("uri", "")
+            dependency_uri = dependency.get("uri")
             dependency_digest_data = dependency.get("digest")
 
             if not isinstance(dependency_uri, str):
                 continue
 
+            dependency_repository = normalize_repository_identity(
+                dependency_uri
+            )
+
             if isinstance(dependency_digest_data, dict):
-                dependency_commit = dependency_digest_data.get(
-                    "gitCommit"
-                )
+                dependency_commit = dependency_digest_data.get("gitCommit")
             else:
                 dependency_commit = None
 
             if (
-                evidence_repository in dependency_uri
-                and dependency_commit == evidence_commit_sha
+                expected_repository is not None
+                and dependency_repository == expected_repository
+                and isinstance(dependency_commit, str)
+                and dependency_commit.lower() == evidence_commit_sha.lower()
             ):
                 match_found = True
                 break
@@ -488,11 +569,29 @@ def write_report(report: dict, dist_dir: Path) -> Path:
 
 def main() -> int:
     """Run verification and return a process exit code."""
-    repo_root = get_repository_root()
-    dist_dir = repo_root / DIST_DIR_NAME
+    import argparse
 
-    report = verify(dist_dir)
-    report_path = write_report(report, dist_dir)
+    parser = argparse.ArgumentParser(
+        description="Verify build artifact, evidence, and provenance."
+    )
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=get_repository_root() / DIST_DIR_NAME,
+        help=(
+            "Directory containing the artifact, build evidence, "
+            "and provenance. Defaults to BuildGuard's dist directory."
+        ),
+    )
+    args = parser.parse_args()
+    dist_dir = args.dist_dir.resolve()
+
+    try:
+        report = verify(dist_dir)
+        report_path = write_report(report, dist_dir)
+    except (OSError, ValueError) as exc:
+        print(f"Verification could not complete: {exc}")
+        return 1
 
     print(f"Verification report written: {report_path}")
     print(f"Overall status: {report['verification_status']}")

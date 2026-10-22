@@ -1,5 +1,6 @@
 """Automated tamper-detection experiment for BuildGuard."""
 
+import argparse
 import json
 import shutil
 import sys
@@ -10,9 +11,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts import verify_evidence
 
+
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent
-    dist_dir = repo_root / "dist"
+    parser = argparse.ArgumentParser(
+        description="Test whether BuildGuard detects artifact tampering."
+    )
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent / "dist",
+        help="Directory containing build evidence and provenance.",
+    )
+    args = parser.parse_args()
+    dist_dir = args.dist_dir.resolve()
+
     artifact_name = "buildguard-artifact.zip"
     evidence_name = "build-evidence.json"
     provenance_name = "provenance.json"
@@ -31,20 +43,31 @@ def main() -> int:
         return 1
 
     try:
-        with tempfile.TemporaryDirectory(prefix="buildguard-tamper-") as temp:
+        with tempfile.TemporaryDirectory(
+            prefix="buildguard-tamper-"
+        ) as temp:
             test_dir = Path(temp)
 
-            for filename in (artifact_name, evidence_name, provenance_name):
-                shutil.copy2(dist_dir / filename, test_dir / filename)
+            for filename in (
+                artifact_name,
+                evidence_name,
+                provenance_name,
+            ):
+                shutil.copy2(
+                    dist_dir / filename,
+                    test_dir / filename,
+                )
 
-            # Modify only the temporary copy of the artifact.
+            # Modify only the temporary artifact copy.
             with open(test_dir / artifact_name, "ab") as artifact:
                 artifact.write(b"\nBUILDGUARD_TAMPER_TEST")
 
             report = verify_evidence.verify(test_dir)
             checks = report.get("checks", {})
 
-            digest_failed = checks.get("artifact_digest_match") == "FAIL"
+            digest_failed = (
+                checks.get("artifact_digest_match") == "FAIL"
+            )
             provenance_failed = (
                 checks.get("provenance_artifact_match") == "FAIL"
             )
@@ -62,8 +85,9 @@ def main() -> int:
                     "provenance_artifact_match", "MISSING"
                 ),
                 "test_method": (
-                    "Modified a temporary artifact copy and ran the existing "
-                    "evidence verifier against the copied evidence and provenance."
+                    "Modified a temporary artifact copy and ran the "
+                    "existing evidence verifier against the copied "
+                    "evidence and provenance."
                 ),
             }
 

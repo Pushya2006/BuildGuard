@@ -446,9 +446,26 @@ def run(dist_dir: Path) -> int:
     return 0 if report["final_decision"] == ACCEPT else 1
 
 
+
 def main() -> int:
-    """Run assurance evaluation against the repository's dist directory."""
-    return run(get_repository_root() / DIST_DIR_NAME)
+    """Run assurance evaluation against a selected dist directory."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate build assurance requirements."
+    )
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=get_repository_root() / DIST_DIR_NAME,
+        help=(
+            "Directory containing build evidence and reports. "
+            "Defaults to BuildGuard's dist directory."
+        ),
+    )
+    args = parser.parse_args()
+
+    return run(args.dist_dir.resolve())
 
 
 if __name__ == "__main__":
