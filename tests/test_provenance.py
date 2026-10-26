@@ -117,6 +117,8 @@ def test_provenance_source_fields_populated_from_github_env(dist_dir, monkeypatc
     artifact_digest = build.calculate_sha256(artifact_path)
     evidence = build.build_evidence(artifact_path, artifact_digest)
     build.write_evidence_file(evidence, dist_dir)
+    assert evidence["repository"] == "example-org/buildguard"
+    assert evidence["commit_sha"] == "a" * 40
 
     statement = generate_provenance.generate_provenance(dist_dir)
     predicate = statement["predicate"]

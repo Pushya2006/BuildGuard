@@ -25,6 +25,51 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+def get_source_identity(project_dir: Path) -> dict:
+    """Identify the target project's Git source when available."""
+    project_dir = project_dir.resolve()
+
+    try:
+        repository_root = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        commit_sha = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        remote_result = subprocess.run(
+            ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        remote_url = remote_result.stdout.strip() if remote_result.returncode == 0 else None
+
+        return {
+    "repository": os.environ.get("GITHUB_REPOSITORY"),
+    "repository_url": remote_url,
+    "commit_sha": os.environ.get("GITHUB_SHA"),
+    "local_commit_sha": commit_sha,
+    "source_type": "git",
+    "source_root": repository_root,
+    }
+    except (subprocess.CalledProcessError, OSError):
+        return {
+            "repository": os.environ.get("GITHUB_REPOSITORY"),
+            "repository_url": None,
+            "commit_sha": os.environ.get("GITHUB_SHA"),
+            "source_type": "local",
+            "source_root": str(project_dir),
+        }
+
 
 # Preserve the original BuildGuard packaging configuration.
 ARTIFACT_SOURCE_PATHS = [
@@ -263,15 +308,24 @@ def calculate_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
+
 def build_evidence(
     artifact_path: Path,
     artifact_digest: str,
+    project_dir: Path | None = None,
     tests_status: str = "passed",
 ) -> dict:
     """Assemble build evidence using available environment metadata."""
+    if project_dir is None:
+        project_dir = get_repository_root()
+
+    source = get_source_identity(project_dir)
+
     return {
-        "repository": os.environ.get("GITHUB_REPOSITORY"),
-        "commit_sha": os.environ.get("GITHUB_SHA"),
+        "repository": source["repository"],
+        "commit_sha": source["commit_sha"],
+        "source_type": source["source_type"],
+        "source_root": source["source_root"],
         "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
         "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
         "runner_os": os.environ.get("RUNNER_OS"),
@@ -281,6 +335,8 @@ def build_evidence(
         "build_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "tests_status": tests_status,
         "build_status": "success",
+	    "repository_url": source["repository_url"],
+        "local_commit_sha": source["local_commit_sha"],
     }
 
 
@@ -335,6 +391,7 @@ def main() -> int:
         evidence = build_evidence(
             artifact_path,
             artifact_digest,
+            project_dir=repo_root,
             tests_status="passed",
         )
         evidence_path = write_evidence_file(evidence, dist_dir)

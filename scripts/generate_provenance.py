@@ -138,6 +138,7 @@ def build_internal_parameters() -> dict:
     }
 
 
+
 def build_resolved_dependencies(evidence: dict) -> list:
     """Describe the source repository and commit when available."""
     repository = evidence.get("repository")
@@ -152,6 +153,7 @@ def build_resolved_dependencies(evidence: dict) -> list:
             "digest": {"gitCommit": commit_sha},
         }
     ]
+
 
 
 def build_run_details(evidence: dict) -> dict:
