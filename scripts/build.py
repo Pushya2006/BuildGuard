@@ -1,4 +1,3 @@
-
 """Build script for BuildGuard.
 
 Builds BuildGuard itself by default, or a separate project when
@@ -135,7 +134,8 @@ def collect_files_to_package(
         dist_dir = (repo_root / DIST_DIR_NAME).resolve()
 
         for file_path in sorted(repo_root.rglob("*")):
-            if not file_path.is_file():
+            # Never package symbolic links or non-files.
+            if file_path.is_symlink() or not file_path.is_file():
                 continue
 
             relative_path = file_path.relative_to(repo_root)
@@ -160,6 +160,9 @@ def collect_files_to_package(
     for relative_source in ARTIFACT_SOURCE_PATHS:
         source_path = repo_root / relative_source
 
+        if source_path.is_symlink():
+            continue
+
         if source_path.is_file():
             if not should_exclude(source_path.relative_to(repo_root)):
                 collected_files.append(source_path)
@@ -167,11 +170,15 @@ def collect_files_to_package(
 
         if source_path.is_dir():
             for file_path in sorted(source_path.rglob("*")):
+                # Apply the same symbolic-link protection recursively.
                 if (
-                    file_path.is_file()
-                    and not should_exclude(
-                        file_path.relative_to(repo_root)
-                    )
+                    file_path.is_symlink()
+                    or not file_path.is_file()
+                ):
+                    continue
+
+                if not should_exclude(
+                    file_path.relative_to(repo_root)
                 ):
                     collected_files.append(file_path)
             continue
