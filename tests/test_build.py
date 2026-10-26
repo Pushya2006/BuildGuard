@@ -151,7 +151,12 @@ def test_default_packaging_skips_symlink_source(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    linked_source = project / "app"
+    (project / "app.py").write_text(
+        "VALUE = 'inside'\n",
+        encoding="utf-8",
+    )
+
+    linked_source = project / "linked.py"
     try:
         linked_source.symlink_to(outside_file)
     except (OSError, NotImplementedError):
@@ -161,9 +166,10 @@ def test_default_packaging_skips_symlink_source(tmp_path, monkeypatch):
     monkeypatch.setattr(
         build,
         "ARTIFACT_SOURCE_PATHS",
-        ["app"],
+        ["app.py", "linked.py"],
     )
 
     files = build.collect_files_to_package(project)
 
+    assert project / "app.py" in files
     assert linked_source not in files
