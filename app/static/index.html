@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BuildGuard — build evidence &amp; assurance</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">BG</span>
+      <div><h1>BuildGuard</h1><p>Build evidence, provenance verification &amp; assurance</p></div>
+    </div>
+    <span class="pill" title="The API only accepts connections from this machine">Local only · 127.0.0.1</span>
+  </header>
+
+  <main>
+    <section class="card controls" aria-labelledby="runTitle">
+      <h2 id="runTitle">Start a run</h2>
+      <div class="row">
+        <label for="projectSelect">Project</label>
+        <select id="projectSelect" disabled><option>Loading…</option></select>
+        <button id="runBtn" class="primary" disabled>Run pipeline</button>
+      </div>
+      <p class="muted small" id="projectsInfo"></p>
+      <p class="warn small">Running a project executes its tests (its code) on this machine. Only use projects you trust.</p>
+      <p class="error small" id="notice" role="alert" hidden></p>
+    </section>
+
+    <section id="banner" class="banner idle" aria-live="polite">
+      <div class="banner-label" id="bannerLabel">No run selected</div>
+      <div class="banner-text" id="bannerText">Choose a project and start a run, or open one from the history below.</div>
+    </section>
+
+    <section class="card"><h2>Pipeline</h2><ol id="stages" class="stages"></ol></section>
+
+    <div class="grid2">
+      <section class="card"><h2>Assurance requirements</h2><div id="reqs" class="list muted">—</div><p id="disclaimer" class="muted small"></p></section>
+      <section class="card"><h2>Artifact &amp; source</h2><dl id="artifact" class="kv muted">—</dl></section>
+    </div>
+
+    <div class="grid2">
+      <section class="card"><h2>Verification checks</h2><div id="checks" class="muted">—</div></section>
+      <section class="card"><h2>Tamper test</h2><dl id="tamper" class="kv muted">—</dl></section>
+    </div>
+
+    <section class="card"><h2>Reports &amp; provenance</h2>
+      <div class="tabs" id="jsonTabs" role="tablist"></div>
+      <pre id="jsonView" class="code" tabindex="0">—</pre>
+      <h3>Downloads</h3><div id="downloads" class="downloads muted">—</div>
+    </section>
+
+    <section class="card"><h2>Logs</h2>
+      <div class="tabs" id="logTabs" role="tablist"></div>
+      <pre id="logView" class="code" tabindex="0">—</pre>
+    </section>
+
+    <section class="card"><h2>Run history</h2><div id="history" class="history muted">No runs yet.</div></section>
+  </main>
+  <footer>Provenance is unsigned. Locally observed Git source is unattested. BuildGuard does not assign a SLSA level and is not a certification.</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

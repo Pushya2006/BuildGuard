@@ -25,6 +25,21 @@ PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 
 # Describes the build definition; it does not assert an assurance level.
 BUILD_TYPE = "https://github.com/actions/workflows@v1"
+GITHUB_BUILDER_ID = "https://github.com/actions/runner"
+
+# Local builds are described as local; they are never presented as
+# GitHub Actions builds.
+LOCAL_BUILD_TYPE = "urn:buildguard:build-type:local-python@v1"
+LOCAL_BUILDER_ID = "urn:buildguard:builder:local"
+LOCAL_SOURCE_NOTE = (
+    "Locally observed from a clean Git working tree; unattested (not "
+    "signed and not independently verified)."
+)
+
+
+def is_local_build(evidence: dict) -> bool:
+    """True when the evidence says the build ran outside GitHub Actions."""
+    return evidence.get("build_environment") == "local"
 
 
 def get_repository_root() -> Path:
@@ -109,8 +124,42 @@ def verify_artifact_matches_evidence(
     return artifact_path
 
 
-def build_external_parameters() -> dict:
+def build_local_source(evidence: dict):
+    """Describe the locally observed Git source, or None.
+
+    Only a clean working tree with a recorded commit qualifies; a dirty
+    or undetermined tree is not traceable to its commit.
+    """
+    if not is_local_build(evidence):
+        return None
+
+    commit = evidence.get("local_commit_sha")
+    uri = evidence.get("source_uri")
+
+    if not commit or not uri or evidence.get("source_dirty") is not False:
+        return None
+
+    return {
+        "uri": uri,
+        "digest": {"gitCommit": commit},
+        "observation": LOCAL_SOURCE_NOTE,
+    }
+
+
+def build_external_parameters(evidence: dict | None = None) -> dict:
     """Describe workflow parameters from available GitHub environment data."""
+    if evidence is not None and is_local_build(evidence):
+        # The GitHub-only workflow fields stay present and null rather than
+        # being fabricated for a local build.
+        parameters = {
+            "workflow": {"repository": None, "ref": None, "workflow_ref": None},
+            "build": {"environment": "local"},
+        }
+        source = build_local_source(evidence)
+        if source is not None:
+            parameters["source"] = source
+        return parameters
+
     repository = os.environ.get("GITHUB_REPOSITORY")
     server_url = os.environ.get("GITHUB_SERVER_URL")
 
@@ -127,8 +176,11 @@ def build_external_parameters() -> dict:
     }
 
 
-def build_internal_parameters() -> dict:
+def build_internal_parameters(evidence: dict | None = None) -> dict:
     """Describe available GitHub runner metadata."""
+    if evidence is not None and is_local_build(evidence):
+        return {"local": {"python_version": evidence.get("python_version")}}
+
     return {
         "github": {
             "runner_os": os.environ.get("RUNNER_OS"),
@@ -162,15 +214,19 @@ def build_run_details(evidence: dict) -> dict:
     run_id = evidence.get("workflow_run_id")
 
     invocation_id = None
-    if repository and run_id:
+    if is_local_build(evidence) and evidence.get("run_id"):
+        invocation_id = f"urn:buildguard:run:{evidence['run_id']}"
+    elif repository and run_id:
         invocation_id = (
             f"https://github.com/{repository}/actions/runs/{run_id}"
         )
 
+    local = is_local_build(evidence)
+
     return {
         "builder": {
             # Descriptive identity only; this document is not signed.
-            "id": "https://github.com/actions/runner",
+            "id": LOCAL_BUILDER_ID if local else GITHUB_BUILDER_ID,
         },
         "metadata": {
             "invocationId": invocation_id,
@@ -183,9 +239,11 @@ def build_provenance_predicate(evidence: dict) -> dict:
     """Build the provenance predicate."""
     return {
         "buildDefinition": {
-            "buildType": BUILD_TYPE,
-            "externalParameters": build_external_parameters(),
-            "internalParameters": build_internal_parameters(),
+            "buildType": (
+                LOCAL_BUILD_TYPE if is_local_build(evidence) else BUILD_TYPE
+            ),
+            "externalParameters": build_external_parameters(evidence),
+            "internalParameters": build_internal_parameters(evidence),
             "resolvedDependencies": build_resolved_dependencies(evidence),
         },
         "runDetails": build_run_details(evidence),

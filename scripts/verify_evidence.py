@@ -127,6 +127,69 @@ def normalize_repository_identity(repository: str):
     return f"{owner.lower()}/{repo.lower()}"
 
 
+def verify_local_source(evidence, provenance):
+    """Check locally observed Git source traceability.
+
+    Returns (outcome, detail) where outcome is "PASS", "FAIL" or "SKIP".
+    This confirms that the evidence and provenance agree about a commit
+    recorded from a clean local checkout. It is not an attestation.
+    """
+    if not isinstance(evidence, dict) or evidence.get("build_environment") != "local":
+        return "SKIP", None
+
+    commit = evidence.get("local_commit_sha")
+    uri = evidence.get("source_uri")
+    dirty = evidence.get("source_dirty")
+
+    if not commit:
+        return "SKIP", None
+
+    if dirty is True:
+        # Not a FAIL: nothing is inconsistent, but source traceability
+        # cannot be established, and assurance treats SKIP as unsupported.
+        return "SKIP", (
+            "The local Git working tree had uncommitted or untracked changes "
+            "when the build started, so the artifact cannot be traced to "
+            f"commit '{commit}'. Commit or stash changes and rebuild"
+        )
+
+    if dirty is not False:
+        return "SKIP", (
+            "Could not determine whether the local Git working tree was clean"
+        )
+
+    predicate = provenance.get("predicate")
+    build_definition = predicate.get("buildDefinition") if isinstance(predicate, dict) else None
+    external = (
+        build_definition.get("externalParameters")
+        if isinstance(build_definition, dict)
+        else None
+    )
+    source = external.get("source") if isinstance(external, dict) else None
+
+    if not isinstance(source, dict):
+        return "FAIL", "Provenance has no locally observed source entry"
+
+    digest = source.get("digest")
+    source_commit = digest.get("gitCommit") if isinstance(digest, dict) else None
+
+    if (
+        source.get("uri") != uri
+        or not isinstance(source_commit, str)
+        or source_commit.lower() != str(commit).lower()
+    ):
+        return "FAIL", (
+            "Provenance source does not match the commit recorded in "
+            "build-evidence.json"
+        )
+
+    return "PASS", (
+        f"Provenance source '{uri}' at commit '{commit}' matches build "
+        "evidence for a clean local working tree. This is locally observed "
+        "and unattested: not signed and not from a trusted builder"
+    )
+
+
 class VerificationResult:
     """Accumulate verification outcomes in a predictable order."""
 
@@ -472,11 +535,19 @@ def verify(dist_dir: Path) -> dict:
     )
 
     if not evidence_repository or not evidence_commit_sha:
-        result.skip(
-            "source_commit_match",
-            "build-evidence.json has no repository/commit_sha to verify "
-            "(expected for local, non-GitHub-Actions builds)",
-        )
+        local_outcome, local_detail = verify_local_source(evidence, provenance)
+
+        if local_outcome == "PASS":
+            result.record("source_commit_match", True, local_detail)
+        elif local_outcome == "FAIL":
+            result.record("source_commit_match", False, local_detail)
+        else:
+            result.skip(
+                "source_commit_match",
+                local_detail
+                or "build-evidence.json has no repository/commit_sha to "
+                "verify (expected for local, non-GitHub-Actions builds)",
+            )
 
     elif (
         not isinstance(evidence_repository, str)

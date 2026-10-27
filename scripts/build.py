@@ -21,54 +21,157 @@ import os
 import platform
 import subprocess
 import sys
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
-def get_source_identity(project_dir: Path) -> dict:
-    """Identify the target project's Git source when available."""
+def _git_output(project_dir: Path, *args: str) -> str:
+    """Run a read-only git command in project_dir and return stdout."""
+    return subprocess.run(
+        ["git", "-C", str(project_dir), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def sanitize_remote_url(remote_url: str | None) -> str | None:
+    """Remove any embedded credentials from a Git remote URL."""
+    if not remote_url:
+        return None
+
+    if "://" in remote_url:
+        parts = urlsplit(remote_url)
+        if parts.username or parts.password:
+            host = parts.hostname or ""
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            return urlunsplit(
+                (parts.scheme, host, parts.path, parts.query, parts.fragment)
+            )
+
+    return remote_url
+
+
+def is_working_tree_dirty(
+    project_dir: Path,
+    ignore_dir: Path | None = None,
+) -> bool | None:
+    """Return True if the project has uncommitted changes.
+
+    Untracked files count as changes because they could be packaged.
+    Files that packaging always excludes (caches, bytecode, secrets,
+    root-level build output) and BuildGuard's own output directory are
+    ignored. Returns None when the state cannot be determined.
+    """
     project_dir = project_dir.resolve()
 
     try:
-        repository_root = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
+        toplevel = Path(_git_output(project_dir, "rev-parse", "--show-toplevel"))
+        output = subprocess.run(
+            [
+                "git", "-C", str(project_dir),
+                "status", "--porcelain", "--untracked-files=all", "--", ".",
+            ],
             capture_output=True,
             text=True,
             check=True,
-        ).stdout.strip()
-
-        commit_sha = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-
-        remote_result = subprocess.run(
-            ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        remote_url = remote_result.stdout.strip() if remote_result.returncode == 0 else None
-
-        return {
-    "repository": os.environ.get("GITHUB_REPOSITORY"),
-    "repository_url": remote_url,
-    "commit_sha": os.environ.get("GITHUB_SHA"),
-    "local_commit_sha": commit_sha,
-    "source_type": "git",
-    "source_root": repository_root,
-    }
+        ).stdout
     except (subprocess.CalledProcessError, OSError):
-        return {
-            "repository": os.environ.get("GITHUB_REPOSITORY"),
-            "repository_url": None,
-            "commit_sha": os.environ.get("GITHUB_SHA"),
-            "source_type": "local",
-            "source_root": str(project_dir),
+        return None
+
+    ignore_prefix = None
+    if ignore_dir is not None:
+        try:
+            ignore_prefix = (
+                ignore_dir.resolve().relative_to(toplevel.resolve()).as_posix()
+            )
+        except ValueError:
+            ignore_prefix = None
+
+    for line in output.splitlines():
+        entry = line[3:].split(" -> ")[-1].strip().strip('"')
+        if ignore_prefix and (
+            entry == ignore_prefix or entry.startswith(ignore_prefix + "/")
+        ):
+            continue
+
+        # Changes to files that are never packaged (caches, bytecode,
+        # secrets, build output) cannot alter the artifact.
+        try:
+            relative = (toplevel / entry).resolve().relative_to(project_dir)
+        except ValueError:
+            return True
+        if should_exclude(relative):
+            continue
+
+        return True
+
+    return False
+
+
+def get_source_identity(
+    project_dir: Path,
+    ignore_dir: Path | None = None,
+) -> dict:
+    """Identify the target project's Git source when available.
+
+    Every key is always present so callers never fail on projects that
+    have no Git metadata. ``repository`` and ``commit_sha`` come only
+    from GitHub Actions; the ``local_*`` values are observed from a
+    local Git checkout and are not an attestation.
+    """
+    project_dir = project_dir.resolve()
+
+    identity = {
+        "repository": os.environ.get("GITHUB_REPOSITORY"),
+        "repository_url": None,
+        "commit_sha": os.environ.get("GITHUB_SHA"),
+        "local_commit_sha": None,
+        "source_type": "local",
+        "source_root": str(project_dir),
+        "source_dirty": None,
+        "source_uri": None,
+    }
+
+    try:
+        repository_root = _git_output(project_dir, "rev-parse", "--show-toplevel")
+        commit_sha = _git_output(project_dir, "rev-parse", "HEAD")
+        # A project that merely sits inside some other repository (for
+        # example an ignored or untracked folder) must not inherit that
+        # repository's commit: require tracked files in the project.
+        tracked = _git_output(project_dir, "ls-files", "--cached", "--", ".")
+    except (subprocess.CalledProcessError, OSError):
+        return identity
+
+    if not tracked:
+        return identity
+
+    remote_result = subprocess.run(
+        ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    remote_url = (
+        sanitize_remote_url(remote_result.stdout.strip())
+        if remote_result.returncode == 0
+        else None
+    )
+
+    identity.update(
+        {
+            "repository_url": remote_url,
+            "local_commit_sha": commit_sha,
+            "source_type": "git",
+            "source_root": repository_root,
+            "source_dirty": is_working_tree_dirty(project_dir, ignore_dir),
+            "source_uri": remote_url or f"local-git:{project_dir.name}",
         }
+    )
+    return identity
 
 
 # Preserve the original BuildGuard packaging configuration.
@@ -79,7 +182,10 @@ ARTIFACT_SOURCE_PATHS = [
 
 ARTIFACT_FILENAME = "buildguard-artifact.zip"
 EVIDENCE_FILENAME = "build-evidence.json"
+BUILD_STATUS_FILENAME = "build-status.json"
+TEST_LOG_FILENAME = "test-output.log"
 DIST_DIR_NAME = "dist"
+DEFAULT_TEST_TIMEOUT_SECONDS = 600
 
 # Known generated outputs from this pipeline.
 GENERATED_OUTPUT_FILENAMES = (
@@ -89,21 +195,29 @@ GENERATED_OUTPUT_FILENAMES = (
     "verification-report.json",
     "tamper-test-report.json",
     "assurance-report.json",
+    BUILD_STATUS_FILENAME,
+    TEST_LOG_FILENAME,
 )
 
-EXCLUDED_NAME_FRAGMENTS = (
-    "__pycache__",
-    ".pytest_cache",
-    ".git",
-    ".venv",
-    "venv",
-    ".tox",
-    ".mypy_cache",
-    ".ruff_cache",
-    "node_modules",
-    "dist",
-    "build",
+# Directories that are never project source, at any depth.
+EXCLUDED_DIR_NAMES = frozenset(
+    {
+        "__pycache__",
+        ".pytest_cache",
+        ".git",
+        ".venv",
+        "venv",
+        ".tox",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".eggs",
+        "node_modules",
+    }
 )
+
+# Conventional output directories. They are generated output only at the
+# project root; nested names such as src/build/ are legitimate source.
+ROOT_ONLY_EXCLUDED_NAMES = frozenset({"dist", "build"})
 
 # Common sensitive files that should not be packaged.
 EXCLUDED_EXACT_FILENAMES = {
@@ -142,11 +256,22 @@ def remove_previous_build_outputs(dist_dir: Path) -> None:
 
 
 def should_exclude(path: Path) -> bool:
-    """Return True for generated files, common secrets, and caches."""
+    """Return True for generated files, common secrets, and caches.
+
+    ``path`` is relative to the project root.
+    """
     if path.suffix.lower() == ".pyc":
         return True
 
-    if any(part.lower() in EXCLUDED_NAME_FRAGMENTS for part in path.parts):
+    parts = [part.lower() for part in path.parts]
+
+    if any(
+        part in EXCLUDED_DIR_NAMES or part.endswith(".egg-info")
+        for part in parts
+    ):
+        return True
+
+    if parts and parts[0] in ROOT_ONLY_EXCLUDED_NAMES:
         return True
 
     filename = path.name.lower()
@@ -170,13 +295,18 @@ def should_exclude(path: Path) -> bool:
 def collect_files_to_package(
     repo_root: Path,
     external_project: bool = False,
+    dist_dir: Path | None = None,
 ) -> list[Path]:
     """Collect source files for BuildGuard or an external project."""
     repo_root = repo_root.resolve()
     collected_files: list[Path] = []
 
     if external_project:
-        dist_dir = (repo_root / DIST_DIR_NAME).resolve()
+        dist_dir = (
+            dist_dir.resolve()
+            if dist_dir is not None
+            else (repo_root / DIST_DIR_NAME).resolve()
+        )
 
         for file_path in sorted(repo_root.rglob("*")):
             # Never package symbolic links or non-files.
@@ -259,6 +389,7 @@ def create_build_artifact(
     files_to_package = collect_files_to_package(
         repo_root,
         external_project=external_project,
+        dist_dir=dist_dir,
     )
 
     with zipfile.ZipFile(
@@ -273,28 +404,60 @@ def create_build_artifact(
     return artifact_path
 
 
-def run_project_tests(project_dir: Path) -> bool:
-    """Run pytest in the target project and return its actual result."""
+def execute_project_tests(
+    project_dir: Path,
+    log_path: Path | None = None,
+    timeout: int | None = DEFAULT_TEST_TIMEOUT_SECONDS,
+) -> str:
+    """Run pytest in the target project and return its real outcome.
+
+    Returns "passed", "failed", "timeout" or "error". Combined output is
+    echoed and, when log_path is given, saved there.
+    """
     print(f"Running pytest in: {project_dir}")
+
+    status = "error"
+    output = ""
 
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-v",
-            ],
+            [sys.executable, "-m", "pytest", "-v"],
             cwd=project_dir,
             check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=timeout,
         )
+        output = result.stdout or ""
+        status = "passed" if result.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        output = partial + f"\n[BuildGuard] pytest exceeded the {timeout}s timeout and was stopped.\n"
+        status = "timeout"
     except OSError as exc:
-        print(f"Could not run project tests: {exc}")
-        return False
+        output = f"[BuildGuard] Could not run project tests: {exc}\n"
 
-    passed = result.returncode == 0
-    print(f"Project tests: {'PASSED' if passed else 'FAILED'}")
-    return passed
+    print(output, end="" if output.endswith("\n") else "\n")
+
+    if log_path is not None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(output, encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not write test log: {exc}")
+
+    print(f"Project tests: {status.upper()}")
+    return status
+
+
+def run_project_tests(project_dir: Path) -> bool:
+    """Run pytest in the target project and return whether it passed."""
+    return execute_project_tests(project_dir) == "passed"
 
 
 def calculate_sha256(file_path: Path) -> str:
@@ -309,17 +472,35 @@ def calculate_sha256(file_path: Path) -> str:
 
 
 
+def generate_run_id() -> str:
+    """Return a unique, sortable run identifier."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def detect_build_environment() -> str:
+    """Distinguish GitHub Actions builds from local builds."""
+    if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("GITHUB_RUN_ID"):
+        return "github-actions"
+    return "local"
+
+
 def build_evidence(
     artifact_path: Path,
     artifact_digest: str,
     project_dir: Path | None = None,
     tests_status: str = "passed",
+    source: dict | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """Assemble build evidence using available environment metadata."""
     if project_dir is None:
         project_dir = get_repository_root()
 
-    source = get_source_identity(project_dir)
+    # Callers may pass a source identity captured before the tests ran,
+    # so files created by the test run cannot make the tree look dirty.
+    if source is None:
+        source = get_source_identity(project_dir)
 
     return {
         "repository": source["repository"],
@@ -335,8 +516,13 @@ def build_evidence(
         "build_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "tests_status": tests_status,
         "build_status": "success",
-	    "repository_url": source["repository_url"],
+        "repository_url": source["repository_url"],
         "local_commit_sha": source["local_commit_sha"],
+        "project_name": Path(project_dir).resolve().name,
+        "run_id": run_id,
+        "build_environment": detect_build_environment(),
+        "source_dirty": source.get("source_dirty"),
+        "source_uri": source.get("source_uri"),
     }
 
 
@@ -352,6 +538,37 @@ def write_evidence_file(evidence: dict, dist_dir: Path) -> Path:
     return evidence_path
 
 
+def write_build_status(
+    dist_dir: Path,
+    *,
+    run_id: str,
+    project_name: str,
+    build_status: str,
+    tests_status: str,
+    started_at: str,
+    failure_reason: str | None = None,
+) -> Path:
+    """Record the outcome of a build attempt, including failed attempts.
+
+    build-evidence.json is written only for successful builds; this file
+    exists so that a failed build can still be displayed and audited.
+    """
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    status_path = dist_dir / BUILD_STATUS_FILENAME
+    status = {
+        "run_id": run_id,
+        "project_name": project_name,
+        "build_status": build_status,
+        "tests_status": tests_status,
+        "failure_reason": failure_reason,
+        "started_at_utc": started_at,
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "test_output_file": TEST_LOG_FILENAME,
+    }
+    status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    return status_path
+
+
 def main() -> int:
     """Run tests, build the artifact, and write evidence."""
     parser = argparse.ArgumentParser(
@@ -363,6 +580,23 @@ def main() -> int:
         default=get_repository_root(),
         help="Project directory to build (defaults to BuildGuard itself).",
     )
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=None,
+        help="Output directory (defaults to <project-dir>/dist).",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Unique run identifier (generated when omitted).",
+    )
+    parser.add_argument(
+        "--test-timeout",
+        type=int,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
+        help="Seconds before the project's test run is stopped.",
+    )
     args = parser.parse_args()
 
     repo_root = args.project_dir.resolve()
@@ -370,18 +604,54 @@ def main() -> int:
     if not repo_root.is_dir():
         parser.error(f"Project directory does not exist: {repo_root}")
 
-    dist_dir = repo_root / DIST_DIR_NAME
+    dist_dir = (
+        args.dist_dir.resolve()
+        if args.dist_dir is not None
+        else repo_root / DIST_DIR_NAME
+    )
+    run_id = args.run_id or generate_run_id()
+    project_name = repo_root.name
+    started_at = datetime.now(timezone.utc).isoformat()
 
     # Invalidate previous results before starting a new build attempt.
     try:
+        dist_dir.mkdir(parents=True, exist_ok=True)
         remove_previous_build_outputs(dist_dir)
     except OSError as exc:
         print(f"Could not remove previous build outputs: {exc}")
         return 1
 
+    def record(build_status, tests_status, reason=None):
+        try:
+            write_build_status(
+                dist_dir,
+                run_id=run_id,
+                project_name=project_name,
+                build_status=build_status,
+                tests_status=tests_status,
+                started_at=started_at,
+                failure_reason=reason,
+            )
+        except OSError as exc:
+            print(f"Could not write build status: {exc}")
+
+    # Capture source identity before tests run, so files created by the
+    # test run (caches, bytecode) cannot affect the clean/dirty result.
+    source = get_source_identity(repo_root, ignore_dir=dist_dir)
+
     # Stop before packaging if the target project's tests fail.
-    if not run_project_tests(repo_root):
-        print("Build stopped because project tests failed.")
+    tests_status = execute_project_tests(
+        repo_root,
+        log_path=dist_dir / TEST_LOG_FILENAME,
+        timeout=args.test_timeout,
+    )
+    if tests_status != "passed":
+        reason = {
+            "failed": "Project tests failed.",
+            "timeout": "Project tests exceeded the time limit.",
+        }.get(tests_status, "Project tests could not be run.")
+        print("Build stopped because project tests did not pass.")
+        record("failed", tests_status, reason)
         return 1
 
     try:
@@ -393,12 +663,17 @@ def main() -> int:
             artifact_digest,
             project_dir=repo_root,
             tests_status="passed",
+            source=source,
+            run_id=run_id,
         )
         evidence_path = write_evidence_file(evidence, dist_dir)
 
-    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
         print(f"Build failed: {exc}")
+        record("failed", "passed", f"Packaging failed: {exc}")
         return 1
+
+    record("success", "passed")
 
     print(f"Build artifact created: {artifact_path}")
     print(f"Artifact SHA-256: {artifact_digest}")

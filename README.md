@@ -17,6 +17,8 @@ It combines automated testing, artifact generation, SHA-256 digest verification,
 - Rule-based assurance evaluation.
 - JSON reports for verification, assurance, and tamper detection.
 - Optional building and evidence processing for an external Python project.
+- Local web UI (FastAPI) that runs the real pipeline and displays its results.
+- Distinct handling of local builds and GitHub Actions builds.
 
 ## Architecture
 
@@ -81,6 +83,8 @@ The pipeline creates the following files in `dist/`:
 | `verification-report.json` | Individual evidence verification results |
 | `tamper-test-report.json` | Results of the tamper-detection experiment |
 | `assurance-report.json` | Assurance requirements and final decision |
+| `build-status.json` | Outcome of the build attempt, including failed attempts |
+| `test-output.log` | Captured output of the project's pytest run |
 
 ## Evidence Verification
 
@@ -155,6 +159,72 @@ python scripts/evaluate_assurance.py --dist-dir "$HOME\OneDrive\Desktop\BuildGua
 
 These commands assume that the external project has a compatible pytest test suite and the files expected by the build process. The build uses the currently active Python environment; it does not provide complete dependency isolation for arbitrary projects.
 
+Additional `build.py` options:
+
+- `--dist-dir DIR` writes all outputs to `DIR` instead of `<project>/dist`, leaving the project untouched.
+- `--run-id ID` sets the run identifier recorded in the evidence (generated when omitted).
+- `--test-timeout SECONDS` stops a hung test run (default 600).
+
+Every build attempt writes `build-status.json` and `test-output.log` to the output directory, including failed attempts. A build whose tests fail still creates no artifact and no `build-evidence.json`.
+
+Packaging excludes caches, virtual environments, secrets, symbolic links and root-level `dist/` and `build/` output. Nested source directories that happen to be named `build` or `dist` (for example `src/build/`) are packaged.
+
+If the project is a Git repository with a clean working tree, the commit is recorded as locally observed source information. See "Local builds and source traceability" below.
+
+## Local builds and source traceability
+
+Builds are labelled `local` or `github-actions` in the evidence, and the provenance describes them accordingly. A local build is never described as a GitHub Actions build.
+
+For a local build, the source-commit check can pass when the project is a Git repository, has tracked files, and had no uncommitted or untracked packaged changes when the build started. The commit is then recorded under `externalParameters.source` in the provenance. This is **locally observed and unattested**: it is not signed, and nothing independent vouches for it. In all other cases the check is skipped and the decision is REVISE.
+
+## Web UI (local)
+
+The web UI runs the same pipeline scripts as the command line and shows the real reports they produce. It does not simulate any result.
+
+Setup (Windows PowerShell, from the repository root, after installing `requirements.txt`):
+
+```powershell
+python scripts/create_demo_projects.py
+python -m app.api
+```
+
+Then open http://127.0.0.1:8000. Choose a project and select **Run pipeline**.
+
+Options for `python -m app.api`: `--projects-root DIR` (default `./projects`), `--runs-root DIR` (default `./runs`) and `--port N`. The environment variables `BUILDGUARD_PROJECTS_ROOT` and `BUILDGUARD_RUNS_ROOT` are also supported. To use your own projects, place each one as a direct child directory of the projects root.
+
+Demo projects and their real outcomes:
+
+| Project | Outcome | Why |
+| --- | --- | --- |
+| `demo-clean` | ACCEPT | Tests pass and the Git tree is clean, so source traceability is supported (locally observed, unattested). |
+| `demo-uncommitted` | REVISE | Uncommitted change: the artifact cannot be traced to a commit. |
+| `demo-no-git` | REVISE | No Git metadata, so no source traceability. |
+| `demo-failing-tests` | BUILD FAILED | Tests fail; no artifact, provenance or decision is produced. |
+
+To see STOP, tamper with the artifact of a finished run (this modifies only that run's saved snapshot) and re-evaluate it. Replace `RUN_ID` with a run ID shown in the history:
+
+```powershell
+Add-Content -Path "runs\RUN_ID\dist\buildguard-artifact.zip" -Value "x" -NoNewline
+python scripts/verify_evidence.py --dist-dir "runs\RUN_ID\dist"
+python scripts/evaluate_assurance.py --dist-dir "runs\RUN_ID\dist"
+```
+
+Each run gets its own directory under the runs root containing `run.json`, per-stage logs and the pipeline outputs. Run statuses are:
+
+- `completed`: all stages ran and a decision (ACCEPT, REVISE or STOP) is available. A non-zero exit code from verification, tamper testing or assurance is treated as a result when a valid report explains it.
+- `build_failed`: the project's tests failed or packaging failed; remaining stages are skipped.
+- `error`: a stage crashed, timed out or did not produce its expected output. This is never reported as success.
+
+API endpoints (loopback only): `GET /api/health`, `GET /api/projects`, `POST /api/runs` with `{"project": "<name>"}`, `GET /api/runs`, `GET /api/runs/{id}`, `GET /api/runs/{id}/logs/{stage}` and `GET /api/runs/{id}/files/{key}`.
+
+Security model:
+
+- The server binds to `127.0.0.1` only and rejects non-loopback clients and unexpected `Host` or `Origin` headers. The bind address is intentionally not configurable.
+- Projects are selected by name from one allow-listed root. The API never accepts a filesystem path, and symbolic-link projects are rejected.
+- No shell is used. Every subprocess has a timeout and receives a minimal environment, without inherited secrets.
+- **Building a project runs its tests, which executes that project's code with your permissions.** Only place projects you trust in the projects root.
+- Only one run can be active at a time.
+
 ## GitHub Actions CI/CD
 
 The workflow is configured in `.github/workflows/ci.yml`.
@@ -178,7 +248,9 @@ The workflow attempts to upload each artifact and report even if an earlier step
 
 - The generated provenance is not cryptographically signed.
 - The verifier checks document structure and consistency; it does not establish provenance authenticity or a trusted builder.
-- A local build does not automatically have GitHub Actions repository, commit, or workflow metadata. Source traceability may therefore be skipped or unsupported.
+- A local build does not have GitHub Actions repository, commit, or workflow metadata. Source traceability for a local build comes from the local Git checkout, is unattested, and is skipped when the tree is dirty or has no Git metadata.
+- Project tests run in the Python environment that launched BuildGuard. Dependencies the project needs must already be installed there; there is no dependency isolation or sandboxing.
+- The web UI is a local tool. It is not designed to be exposed to a network or to run untrusted projects.
 - The tamper-detection experiment checks whether a modified artifact is detected against existing evidence. It does not prove resistance to every possible attack.
 - The assurance decision reflects the project's implemented rules and available evidence. It is not a security certification.
 
