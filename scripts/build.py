@@ -21,11 +21,16 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+if __package__:
+    from . import project_adapters
+else:
+    import project_adapters
 
 def _git_output(project_dir: Path, *args: str) -> str:
     """Run a read-only git command in project_dir and return stdout."""
@@ -404,43 +409,147 @@ def create_build_artifact(
     return artifact_path
 
 
+
 def execute_project_tests(
     project_dir: Path,
     log_path: Path | None = None,
     timeout: int | None = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
-    """Run pytest in the target project and return its real outcome.
+    """Discover, execute and classify project tests through the Python adapter.
 
-    Returns "passed", "failed", "timeout" or "error". Combined output is
-    echoed and, when log_path is given, saved there.
+    The build pipeline accepts only "passed", "failed", "timeout" and "error".
+    Outcomes that are missing or insufficiently verified are never successes.
     """
-    print(f"Running pytest in: {project_dir}")
+    print(f"Discovering Python project tests in: {project_dir}")
 
-    status = "error"
     output = ""
+    status = "error"
+    junit_path = None
 
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-v"],
-            cwd=project_dir,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-        )
-        output = result.stdout or ""
-        status = "passed" if result.returncode == 0 else "failed"
-    except subprocess.TimeoutExpired as exc:
-        partial = exc.stdout or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        output = partial + f"\n[BuildGuard] pytest exceeded the {timeout}s timeout and was stopped.\n"
-        status = "timeout"
-    except OSError as exc:
-        output = f"[BuildGuard] Could not run project tests: {exc}\n"
+        adapter = project_adapters.get_adapter("python")
+        info = project_adapters.inspect_project(project_dir.resolve())
+        runner_info = info.tests
+
+        if runner_info.needs_configuration or runner_info.runner is None:
+            output = (
+                "[BuildGuard] Test runner needs configuration. "
+                f"{runner_info.reason}\n"
+            )
+            status = "error"
+        else:
+            effective_timeout = (
+                timeout
+                if timeout is not None
+                else DEFAULT_TEST_TIMEOUT_SECONDS
+            )
+            config = project_adapters.ProjectConfig(
+                runner=runner_info.runner,
+                timeout_seconds=effective_timeout,
+            )
+
+            if runner_info.runner == "pytest":
+                with tempfile.TemporaryDirectory(prefix="buildguard-junit-") as temp_dir:
+                    junit_path = Path(temp_dir) / "results.xml"
+                    command = adapter.test_command(config, junit_path)
+                    print(f"Running {runner_info.runner} in: {project_dir}")
+
+                    try:
+                        result = subprocess.run(
+                            list(command.argv),
+                            cwd=project_dir,
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            errors="replace",
+                            timeout=effective_timeout,
+                        )
+                        output = result.stdout or ""
+                        outcome = adapter.classify_outcome(
+                            command,
+                            result.returncode,
+                            output,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        partial = exc.stdout or ""
+                        if isinstance(partial, bytes):
+                            partial = partial.decode("utf-8", errors="replace")
+                        output = partial
+                        outcome = adapter.classify_outcome(
+                            command,
+                            None,
+                            output,
+                            timed_out=True,
+                        )
+                    except OSError as exc:
+                        output = f"[BuildGuard] Could not run project tests: {exc}\n"
+                        outcome = adapter.classify_outcome(
+                            command,
+                            None,
+                            output,
+                            launch_error=str(exc),
+                        )
+
+            else:
+                command = adapter.test_command(config)
+                print(f"Running {runner_info.runner} in: {project_dir}")
+
+                try:
+                    result = subprocess.run(
+                        list(command.argv),
+                        cwd=project_dir,
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        errors="replace",
+                        timeout=effective_timeout,
+                    )
+                    output = result.stdout or ""
+                    outcome = adapter.classify_outcome(
+                        command,
+                        result.returncode,
+                        output,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    partial = exc.stdout or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", errors="replace")
+                    output = partial
+                    outcome = adapter.classify_outcome(
+                        command,
+                        None,
+                        output,
+                        timed_out=True,
+                    )
+                except OSError as exc:
+                    output = f"[BuildGuard] Could not run project tests: {exc}\n"
+                    outcome = adapter.classify_outcome(
+                        command,
+                        None,
+                        output,
+                        launch_error=str(exc),
+                    )
+
+            output += (
+                f"\n[BuildGuard] Test outcome: {outcome.status}. "
+                f"{outcome.reason}\n"
+            )
+            status = (
+                outcome.status
+                if outcome.status in {"passed", "failed", "timeout", "error"}
+                else "error"
+            )
+
+    except project_adapters.ProjectError as exc:
+        output = f"[BuildGuard] {exc.message}\n"
+        status = "error"
+    except (OSError, ValueError, TypeError) as exc:
+        output = f"[BuildGuard] Project test discovery failed: {exc}\n"
+        status = "error"
 
     print(output, end="" if output.endswith("\n") else "\n")
 
