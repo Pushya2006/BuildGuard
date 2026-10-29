@@ -47,3 +47,9 @@ tr:first-child td{border-top:0}td.n{font-family:ui-monospace,Menlo,Consolas,mono
 footer{max-width:1100px;margin:0 auto;padding:1rem clamp(.75rem,3vw,1.5rem) 2rem;color:var(--muted);font-size:.8rem}
 @media (max-width:520px){.history button{grid-template-columns:1fr auto}.history .t{grid-column:1/-1}}
 @media (prefers-reduced-motion:reduce){.chip.blue{animation:none}}
+
+input{font:inherit;padding:.5rem .8rem;border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:var(--text);min-width:14rem;flex:1 1 20rem}
+.local-import-row{margin:.5rem 0}
+.local-import-row label{flex:0 0 100%}
+#localProjectInfo{margin-top:.75rem;max-height:14rem}
+hr{border:0;border-top:1px solid var(--line);margin:1rem 0}

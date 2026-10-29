@@ -40,42 +40,193 @@ let current = null, poll = null, jsonTab = "provenance", logTab = "tests", logCa
 
 function showNotice(msg) { const n = $("notice"); n.hidden = !msg; n.textContent = msg || ""; }
 
-async function loadProjects() {
+async function loadProjects(preferredProject = null) {
   const sel = $("projectSelect");
+  const previous = preferredProject || sel.value;
   try {
     const data = await (await api("/api/projects")).json();
     $("projectsInfo").textContent = "Projects root: " + data.projects_root;
     if (!data.projects.length) {
-      clear(sel, h("option", {}, "No projects found in the projects root"));
+      clear(sel, h("option", { value: "" }, "No projects found in the projects root"));
+      sel.disabled = true;
+      $("runBtn").disabled = true;
       return;
     }
     clear(sel, data.projects.map((p) => h("option", { value: p.name },
       p.name + (p.is_git ? " · git" : " · no git") + (p.has_tests ? "" : " · no tests found"))));
     sel.disabled = false;
+    if (data.projects.some((p) => p.name === previous)) sel.value = previous;
     $("runBtn").disabled = false;
   } catch (e) { showNotice("Could not load projects: " + e.message); }
 }
 
-async function startRun() {
+async function browseLocalProject() {
   showNotice("");
-  $("runBtn").disabled = true;
+  $("browseLocalBtn").disabled = true;
   try {
-    const run = await (await api("/api/runs", { method: "POST", body: JSON.stringify({ project: $("projectSelect").value }) })).json();
-    logCache = {}; logTab = "tests";
-    await openRun(run.run_id);
-  } catch (e) { showNotice(e.message); $("runBtn").disabled = false; }
+    const result = await (await api("/api/projects/browse")).json();
+    if (!result.cancelled && result.path) {
+      $("localProjectPath").value = result.path;
+      $("localProjectInfo").hidden = true;
+      $("localProjectInfo").textContent = "";
+      $("importLocalBtn").disabled = true;
+      showNotice("Folder selected. Click Inspect folder before loading it.");
+    }
+  } catch (e) {
+    showNotice("Could not open the folder picker: " + e.message);
+  } finally {
+    $("browseLocalBtn").disabled = false;
+  }
 }
 
-async function openRun(runId) {
-  clearInterval(poll);
+async function inspectLocalProject() {
+  showNotice("");
+  const path = $("localProjectPath").value.trim();
+  const output = $("localProjectInfo");
+  $("importLocalBtn").disabled = true;
+  output.hidden = false;
+  if (!path) { output.textContent = "Enter or choose a project folder first."; return; }
+  output.textContent = "Inspecting folder (read-only)…";
+  $("inspectLocalBtn").disabled = true;
+  $("importLocalBtn").disabled = true;
   try {
-    current = await (await api("/api/runs/" + encodeURIComponent(runId))).json();
-  } catch (e) { showNotice(e.message); return; }
+    const info = await (await api("/api/projects/inspect", {
+      method: "POST", body: JSON.stringify({ path })
+    })).json();
+    output.textContent = JSON.stringify({
+      name: info.name, path: info.path, project_id: info.project_id,
+      indicators: info.indicators, layout: info.layout, has_git: info.has_git,
+      tests: info.tests, dependencies: info.dependencies, warnings: info.warnings
+    }, null, 2);
+    $("importLocalBtn").disabled = false;
+  } catch (e) {
+    output.textContent = "Inspection failed: " + e.message;
+    showNotice(e.message);
+  } finally {
+    $("inspectLocalBtn").disabled = false;
+  }
+}
+
+async function importLocalProject() {
+  showNotice("");
+  const path = $("localProjectPath").value.trim();
+  if (!path) { showNotice("Enter an absolute project folder path first."); return; }
+  if (!window.confirm("BuildGuard will create a working copy of this folder. The original will not be modified. Continue?")) return;
+  $("importLocalBtn").disabled = true;
+  $("inspectLocalBtn").disabled = true;
+  try {
+    const imported = await (await api("/api/projects/import", {
+      method: "POST", body: JSON.stringify({ path })
+    })).json();
+    $("localProjectInfo").hidden = false;
+    $("localProjectInfo").textContent = JSON.stringify(imported, null, 2);
+    await loadProjects();
+    $("projectSelect").value = imported.project;
+    await showLatestRunForSelectedProject();
+    showNotice(imported.already_imported
+      ? "This project was already loaded. Its existing working copy is selected; click Run pipeline when ready."
+      : "Project loaded. Review the project details, then click Run pipeline when ready.");
+  } catch (e) {
+    showNotice(e.message);
+  } finally {
+    $("importLocalBtn").disabled = false;
+    $("inspectLocalBtn").disabled = false;
+  }
+}
+
+function clearDashboard(message = "No run exists for the selected project yet. Review the project, then click Run pipeline.") {
+  clearInterval(poll);
+  poll = null;
+  current = null;
+  logCache = {};
+  logTab = "tests";
+  jsonTab = "provenance";
+
+  $("banner").className = "banner idle";
+  $("bannerLabel").textContent = "No run selected";
+  $("bannerText").textContent = message;
+  clear($("stages"));
+  $("reqs").className = "list muted";
+  clear($("reqs"), "No run selected.");
+  $("disclaimer").textContent = "";
+  $("artifact").className = "kv muted";
+  clear($("artifact"), "No run selected.");
+  $("checks").className = "muted";
+  clear($("checks"), "No run selected.");
+  $("tamper").className = "kv muted";
+  clear($("tamper"), "No run selected.");
+  clear($("jsonTabs"));
+  $("jsonView").textContent = "No reports for this project yet.";
+  $("downloads").className = "downloads muted";
+  clear($("downloads"), "Nothing to download yet.");
+  clear($("logTabs"));
+  $("logView").textContent = "No logs for this project yet.";
+  $("runBtn").disabled = $("projectSelect").disabled || !$("projectSelect").value;
+}
+
+async function showLatestRunForSelectedProject() {
+  const project = $("projectSelect").value;
+  clearDashboard();
+  if (!project) return;
+  try {
+    const { runs } = await (await api("/api/runs")).json();
+    const match = runs.find((r) => r.project === project);
+    if (match && $("projectSelect").value === project) {
+      await openRun(match.run_id, { expectedProject: project });
+    } else if ($("projectSelect").value === project) {
+      clearDashboard("No run exists for " + project + " yet. Click Run pipeline when ready.");
+    }
+  } catch (e) {
+    showNotice("Could not load this project's run history: " + e.message);
+  }
+}
+
+async function startRun() {
+  showNotice("");
+  const project = $("projectSelect").value;
+  if (!project) {
+    showNotice("Choose or load a project before starting the pipeline.");
+    return;
+  }
+  $("runBtn").disabled = true;
+  try {
+    const run = await (await api("/api/runs", {
+      method: "POST", body: JSON.stringify({ project })
+    })).json();
+    logCache = {};
+    logTab = "tests";
+    await openRun(run.run_id, { expectedProject: project });
+  } catch (e) {
+    showNotice(e.message);
+    $("runBtn").disabled = false;
+  }
+}
+
+async function openRun(runId, options = {}) {
+  clearInterval(poll);
+  poll = null;
+  try {
+    const run = await (await api("/api/runs/" + encodeURIComponent(runId))).json();
+    if (options.expectedProject && $("projectSelect").value !== options.expectedProject) return;
+    if (options.fromHistory) $("projectSelect").value = run.project;
+    else if ($("projectSelect").value && $("projectSelect").value !== run.project) return;
+    current = run;
+  } catch (e) {
+    showNotice(e.message);
+    return;
+  }
   render(current);
   loadHistory();
   const active = ["queued", "running"].includes(current.status);
   $("runBtn").disabled = active || $("projectSelect").disabled;
-  if (active) poll = setInterval(() => openRun(runId), 1000);
+  if (active) {
+    const selectedRunId = runId;
+    poll = setInterval(() => {
+      if (current && current.run_id === selectedRunId) {
+        openRun(selectedRunId, { expectedProject: current.project });
+      }
+    }, 1000);
+  }
 }
 
 function render(run) {
@@ -195,6 +346,7 @@ async function renderLogs(run) {
   if (logCache[key] === undefined) {
     let text;
     try { text = await (await api("/api/runs/" + run.run_id + "/logs/" + logTab)).text(); } catch (e) { text = "Could not load log: " + e.message; }
+    if (!current || current.run_id !== run.run_id) return;
     // Only cache logs of finished runs; a running stage's log still grows.
     if (!["queued", "running"].includes(run.status)) logCache[key] = text;
     view.textContent = text;
@@ -209,7 +361,7 @@ async function loadHistory() {
     const { runs } = await (await api("/api/runs")).json();
     if (!runs.length) { box.className = "history muted"; clear(box, "No runs yet."); return; }
     box.className = "history";
-    clear(box, runs.map((r) => h("button", { type: "button", "aria-current": String(current && current.run_id === r.run_id), onclick: () => { logCache = {}; logTab = "tests"; openRun(r.run_id); } },
+    clear(box, runs.map((r) => h("button", { type: "button", "aria-current": String(current && current.run_id === r.run_id), onclick: () => { logCache = {}; logTab = "tests"; $("projectSelect").value = r.project; openRun(r.run_id, { fromHistory: true }); } },
       h("span", {}, h("strong", {}, r.project), " ", h("span", { class: "t" }, r.run_id)),
       chip(r.decision || r.status, r.decision || STATUS_TEXT[r.status] || r.status),
       h("span", { class: "t" }, when(r.created_at)))));
@@ -217,11 +369,17 @@ async function loadHistory() {
 }
 
 $("runBtn").addEventListener("click", startRun);
+$("browseLocalBtn").addEventListener("click", browseLocalProject);
+$("inspectLocalBtn").addEventListener("click", inspectLocalProject);
+$("importLocalBtn").addEventListener("click", importLocalProject);
+$("projectSelect").addEventListener("change", showLatestRunForSelectedProject);
+$("localProjectPath").addEventListener("input", () => {
+  $("importLocalBtn").disabled = true;
+  $("localProjectInfo").hidden = true;
+});
+$("importLocalBtn").disabled = true;
 (async () => {
   await loadProjects();
   await loadHistory();
-  try {
-    const { runs } = await (await api("/api/runs")).json();
-    if (runs.length) await openRun(runs[0].run_id);
-  } catch (e) { /* history already reports errors */ }
+  await showLatestRunForSelectedProject();
 })();

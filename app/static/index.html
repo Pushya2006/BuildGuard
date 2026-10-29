@@ -24,6 +24,17 @@
         <button id="runBtn" class="primary" disabled>Run pipeline</button>
       </div>
       <p class="muted small" id="projectsInfo"></p>
+      <hr>
+      <h3>Import a local Python project</h3>
+      <div class="row local-import-row">
+        <label for="localProjectPath">Project folder path</label>
+        <input id="localProjectPath" type="text" autocomplete="off" spellcheck="false" placeholder="C:\Users\you\Documents\my-project">
+        <button id="browseLocalBtn" type="button">Choose folder…</button>
+        <button id="inspectLocalBtn" type="button">Inspect folder</button>
+        <button id="importLocalBtn" class="primary" type="button">Load working copy</button>
+      </div>
+      <p class="muted small">Choose a folder or enter its absolute path. Inspection is read-only. Loading creates a working copy inside BuildGuard; the original folder is not modified. Python projects only are currently supported.</p>
+      <pre id="localProjectInfo" class="code" hidden></pre>
       <p class="warn small">Running a project executes its tests (its code) on this machine. Only use projects you trust.</p>
       <p class="error small" id="notice" role="alert" hidden></p>
     </section>

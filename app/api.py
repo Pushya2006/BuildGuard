@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,6 +37,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from scripts.project_adapters import ProjectError, get_adapter, make_project_id, validate_project_path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -204,6 +207,10 @@ class RunRequest(BaseModel):
     project: str = Field(min_length=1, max_length=100, pattern=PROJECT_NAME_PATTERN)
 
 
+class LocalProjectPathRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+
+
 class BusyError(Exception):
     pass
 
@@ -256,6 +263,69 @@ class RunManager:
                 }
             )
         return projects
+
+    def inspect_external_project(self, raw_path: str) -> dict:
+        """Inspect a local project without executing or modifying its code."""
+        try:
+            path = validate_project_path(
+                raw_path,
+                forbidden_roots=(REPO_ROOT, self.projects_root, self.runs_root),
+            )
+            # Do not allow choosing a parent directory that contains BuildGuard itself.
+            if REPO_ROOT == path or REPO_ROOT in path.parents or path in REPO_ROOT.parents:
+                raise ProjectError("unsafe_location", "Choose a specific project folder outside the BuildGuard installation and its parent folders.")
+            info = get_adapter("python").discover(
+                str(path), forbidden_roots=(REPO_ROOT, self.projects_root, self.runs_root)
+            )
+            return info.to_dict()
+        except ProjectError as exc:
+            raise HTTPException(400, exc.message) from exc
+
+    def import_external_project(self, raw_path: str) -> dict:
+        """Copy a validated local project into the allow-listed projects root."""
+        info = self.inspect_external_project(raw_path)
+        source = Path(info["path"])
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", source.name).strip(".-")[:60] or "project"
+        project_name = f"local-{safe_name}-{info['project_id'][:8]}"
+        destination = self.projects_root / project_name
+        if destination.exists():
+            return {
+                "project": project_name,
+                "source_name": source.name,
+                "source_path": str(source),
+                "working_copy": str(destination),
+                "inspection": info,
+                "already_imported": True,
+                "message": "This project already has a working copy. The existing copy was kept unchanged.",
+            }
+
+        excluded_dirs = {
+            "__pycache__", ".venv", "venv", "env", "node_modules", ".pytest_cache",
+            ".mypy_cache", ".ruff_cache", ".tox", "site-packages", "dist", "build",
+        }
+
+        def ignore_entries(directory, names):
+            ignored = []
+            for name in names:
+                candidate = Path(directory) / name
+                if name in excluded_dirs or candidate.is_symlink():
+                    ignored.append(name)
+            return ignored
+
+        try:
+            shutil.copytree(source, destination, ignore=ignore_entries, symlinks=False)
+        except Exception as exc:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(400, f"Could not create a working copy: {exc}") from exc
+
+        return {
+            "project": project_name,
+            "source_name": source.name,
+            "source_path": str(source),
+            "working_copy": str(destination),
+            "inspection": info,
+            "message": "A working copy was created. The original project was not modified.",
+        }
 
     # ---- runs -----------------------------------------------------
 
@@ -580,6 +650,40 @@ def create_app(
     @app.get("/api/projects")
     def projects():
         return {"projects_root": str(manager.projects_root), "projects": manager.list_projects()}
+
+    @app.get("/api/projects/browse")
+    def browse_local_project():
+        """Open a native folder picker on the local machine running BuildGuard."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+                selected = filedialog.askdirectory(
+                    parent=root,
+                    title="Choose a Python project folder",
+                    mustexist=True,
+                )
+            finally:
+                root.destroy()
+        except Exception as exc:
+            raise HTTPException(
+                501,
+                f"Native folder picker is unavailable ({exc}). Enter the absolute folder path instead.",
+            ) from exc
+        if not selected:
+            return {"cancelled": True, "path": ""}
+        return {"cancelled": False, "path": str(Path(selected).resolve())}
+
+    @app.post("/api/projects/inspect")
+    def inspect_local_project(body: LocalProjectPathRequest):
+        return manager.inspect_external_project(body.path)
+
+    @app.post("/api/projects/import")
+    def import_local_project(body: LocalProjectPathRequest):
+        return manager.import_external_project(body.path)
 
     @app.post("/api/runs", status_code=202)
     def create_run(body: RunRequest):
